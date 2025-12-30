@@ -57,6 +57,118 @@ from utils.general import (
 )
 from utils.torch_utils import torch_distributed_zero_first
 
+from osgeo import gdal
+
+
+def read_image(path, mode, **kwargs):
+    """
+    mode="tif"  : 读取tif文件
+    mode="npy"  : 读取npy文件
+    mode="img"  : 读取普通图像(jpg/png等)
+    """
+    '''
+    Args:
+        path: 图像路径
+        mode: 读取模式，tif/npy/img
+        **kwargs: 其他参数
+    '''
+    '''bands: 波段数默认为加载3波段图像'''
+    bands = kwargs.get("bands", 3)
+
+    if mode == "tif":
+        if path.lower().endswith(".tif"):
+            im_width, im_height, im_bands, projection, geotrans, im0 = readTif(path, bands)
+        return im0
+
+    elif mode == "npy":
+        if path.lower().endswith(".npy"):
+            im0 = np.load(path.replace(".tif", ".npy"))
+        return im0
+
+    elif mode == "img":
+        im0 = cv2.imread(path)  # BGR
+        return im0
+
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+
+def normalize_percentile(img_array):
+    """
+    分波段 2% 线性拉伸 - 专为 YOLO-PI 物理特征设计
+    """
+    bands, h, w = img_array.shape
+    out_img = np.zeros_like(img_array, dtype=np.uint8)
+
+    # 将数据转为 float32 进行计算，避免溢出
+    img_float = img_array.astype(np.float32)
+
+    for i in range(bands):
+        band = img_float[i, :, :]
+
+        # 1. 计算 2% 和 98% 分位点 (剔除异常值)
+        # 这种方法会自动忽略极亮(云)和极暗(阴影)的噪点
+        p2 = np.percentile(band, 2)
+        p98 = np.percentile(band, 98)
+
+        # 2. 拉伸计算
+        # 将 [p2, p98] 映射到 [0, 255]
+        if p98 - p2 == 0:
+            out_img[i, :, :] = 0
+        else:
+            scale = 255.0 / (p98 - p2)
+            band_scaled = (band - p2) * scale
+
+            # 3. 截断并转为 uint8
+            band_clipped = np.clip(band_scaled, 0, 255)
+            out_img[i, :, :] = band_clipped.astype(np.uint8)
+
+    return out_img
+
+
+def readTif(img_file_path, bands=3):
+    """
+    读取栅格数据，将其转换成对应数组
+    img_file_path: 栅格数据路径
+    :return: 返回投影，几何信息，和转换后的数组
+    """
+    dataset = gdal.Open(img_file_path)  # 读取栅格数据
+    # 判断是否读取到数据
+    if dataset is None:
+        raise FileNotFoundError(f"Unable to open {img_file_path}")
+    projection = dataset.GetProjection()  # 投影
+    geotrans = dataset.GetGeoTransform()  # 几何信息
+    im_width = dataset.RasterXSize  # 栅格矩阵的列数
+    im_height = dataset.RasterYSize  # 栅格矩阵的行数
+    im_bands = dataset.RasterCount  # 波段数
+    # print(im_bands)
+    # 直接读取dataset
+    img_array = dataset.ReadAsArray()
+    if img_array is None:
+        raise ValueError(f"ReadAsArray failed for {img_file_path}")
+    # 归一化
+    if im_bands == 1:
+        img_array = np.tile(img_array, (3, 1, 1))
+    if bands == 3 and im_bands >= 3:
+        img_array = img_array[:3, :, :].copy()  # 取R G B三个波段
+        im_bands = 3
+    elif im_bands >= 4 and bands == 4:
+        img_array = img_array[:4, :, :].copy()
+        im_bands = 4
+
+    # --- 【关键修改】使用 2% 拉伸替代 Min-Max ---
+    # 这一步能显著增强金属目标的 Intensity 特征
+    img = normalize_percentile(img_array)
+    '''校正后处理'''
+    # imgScale = (img_array - np.min(img_array)) / (np.max(img_array) - np.min(img_array))
+    #
+    # img = np.round(imgScale * 255).astype(np.uint8)
+    # # TIS GIU 使用
+    img = np.transpose(img, (1, 2, 0))
+    # img = histEqualize(img)
+    return im_width, im_height, im_bands, projection, geotrans, img
+
+
 # Parameters
 HELP_URL = "See https://docs.ultralytics.com/yolov5/tutorials/train_custom_data"
 IMG_FORMATS = "bmp", "dng", "jpeg", "jpg", "mpo", "png", "tif", "tiff", "webp", "pfm"  # include image suffixes
@@ -122,7 +234,7 @@ def seed_worker(worker_id):
 
     See https://pytorch.org/docs/stable/notes/randomness.html#dataloader.
     """
-    worker_seed = torch.initial_seed() % 2**32
+    worker_seed = torch.initial_seed() % 2 ** 32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
 
@@ -157,23 +269,23 @@ class SmartDistributedSampler(distributed.DistributedSampler):
 
 
 def create_dataloader(
-    path,
-    imgsz,
-    batch_size,
-    stride,
-    single_cls=False,
-    hyp=None,
-    augment=False,
-    cache=False,
-    pad=0.0,
-    rect=False,
-    rank=-1,
-    workers=8,
-    image_weights=False,
-    quad=False,
-    prefix="",
-    shuffle=False,
-    seed=0,
+        path,
+        imgsz,
+        batch_size,
+        stride,
+        single_cls=False,
+        hyp=None,
+        augment=False,
+        cache=False,
+        pad=0.0,
+        rect=False,
+        rank=-1,
+        workers=8,
+        image_weights=False,
+        quad=False,
+        prefix="",
+        shuffle=False,
+        seed=0,
 ):
     """Creates and returns a configured DataLoader instance for loading and processing image datasets."""
     if rect and shuffle:
@@ -388,7 +500,8 @@ class LoadImages:
         else:
             # Read image
             self.count += 1
-            im0 = cv2.imread(path)  # BGR
+            # im0 = cv2.imread(path)  # BGR
+            im0 = read_image(path, "tif")
             assert im0 is not None, f"Image Not Found {path}"
             s = f"image {self.count}/{self.nf} {path}: "
 
@@ -535,22 +648,22 @@ class LoadImagesAndLabels(Dataset):
     rand_interp_methods = [cv2.INTER_NEAREST, cv2.INTER_LINEAR, cv2.INTER_CUBIC, cv2.INTER_AREA, cv2.INTER_LANCZOS4]
 
     def __init__(
-        self,
-        path,
-        img_size=640,
-        batch_size=16,
-        augment=False,
-        hyp=None,
-        rect=False,
-        image_weights=False,
-        cache_images=False,
-        single_cls=False,
-        stride=32,
-        pad=0.0,
-        min_items=0,
-        prefix="",
-        rank=-1,
-        seed=0,
+            self,
+            path,
+            img_size=640,
+            batch_size=16,
+            augment=False,
+            hyp=None,
+            rect=False,
+            image_weights=False,
+            cache_images=False,
+            single_cls=False,
+            stride=32,
+            pad=0.0,
+            min_items=0,
+            prefix="",
+            rank=-1,
+            seed=0,
     ):
         """Initializes the YOLOv5 dataset loader, handling images and their labels, caching, and preprocessing."""
         self.img_size = img_size
@@ -701,7 +814,7 @@ class LoadImagesAndLabels(Dataset):
         for _ in range(n):
             im = cv2.imread(random.choice(self.im_files))  # sample image
             ratio = self.img_size / max(im.shape[0], im.shape[1])  # max(h, w)  # ratio
-            b += im.nbytes * ratio**2
+            b += im.nbytes * ratio ** 2
         mem_required = b * self.n / n  # GB required to cache dataset into RAM
         mem = psutil.virtual_memory()
         cache = mem_required * (1 + safety_margin) < mem.available  # to cache or not to cache, that is the question
@@ -853,7 +966,8 @@ class LoadImagesAndLabels(Dataset):
             if fn.exists():  # load npy
                 im = np.load(fn)
             else:  # read image
-                im = cv2.imread(f)  # BGR
+                # im = cv2.imread(f)  # BGR
+                im = read_image(f, "tif")
                 assert im is not None, f"Image Not Found {f}"
             h0, w0 = im.shape[:2]  # orig hw
             r = self.img_size / max(h0, w0)  # ratio
@@ -976,12 +1090,12 @@ class LoadImagesAndLabels(Dataset):
             segments9.extend(segments)
 
             # Image
-            img9[y1:y2, x1:x2] = img[y1 - pady :, x1 - padx :]  # img9[ymin:ymax, xmin:xmax]
+            img9[y1:y2, x1:x2] = img[y1 - pady:, x1 - padx:]  # img9[ymin:ymax, xmin:xmax]
             hp, wp = h, w  # height, width previous
 
         # Offset
         yc, xc = (int(random.uniform(0, s)) for _ in self.mosaic_border)  # mosaic center x, y
-        img9 = img9[yc : yc + 2 * s, xc : xc + 2 * s]
+        img9 = img9[yc: yc + 2 * s, xc: xc + 2 * s]
 
         # Concat/clip labels
         labels9 = np.concatenate(labels9, 0)
@@ -1093,7 +1207,7 @@ def extract_boxes(path=DATASETS_DIR / "coco128"):
 
                     b[[0, 2]] = np.clip(b[[0, 2]], 0, w)  # clip boxes outside of image
                     b[[1, 3]] = np.clip(b[[1, 3]], 0, h)
-                    assert cv2.imwrite(str(f), im[b[1] : b[3], b[0] : b[2]]), f"box failure in {f}"
+                    assert cv2.imwrite(str(f), im[b[1]: b[3], b[0]: b[2]]), f"box failure in {f}"
 
 
 def autosplit(path=DATASETS_DIR / "coco128/images", weights=(0.9, 0.1, 0.0), annotated_only=False):
@@ -1129,17 +1243,26 @@ def verify_image_label(args):
     nm, nf, ne, nc, msg, segments = 0, 0, 0, 0, "", []  # number (missing, found, empty, corrupt), message, segments
     try:
         # verify images
-        im = Image.open(im_file)
-        im.verify()  # PIL verify
-        shape = exif_size(im)  # image size
-        assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
-        assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}"
-        if im.format.lower() in ("jpg", "jpeg"):
-            with open(im_file, "rb") as f:
-                f.seek(-2, 2)
-                if f.read() != b"\xff\xd9":  # corrupt JPEG
-                    ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
-                    msg = f"{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved"
+        ''' 更改读取方式'''
+        if im_file.lower().endswith(".npy"):
+            im = read_image(im_file, 'npy')
+        elif im_file.lower().endswith("tif"):
+            im = read_image(im_file, 'tif')
+        else:
+            im = Image.open(im_file)
+        # shape = exif_size(im)  # image size
+        shape = (im.shape[1], im.shape[0])  # hw
+        # im = Image.open(im_file)
+        # im.verify()  # PIL verify
+        # shape = exif_size(im)  # image size
+        # assert (shape[0] > 9) & (shape[1] > 9), f"image size {shape} <10 pixels"
+        # assert im.format.lower() in IMG_FORMATS, f"invalid image format {im.format}"
+        # if im.format.lower() in ("jpg", "jpeg"):
+        #     with open(im_file, "rb") as f:
+        #         f.seek(-2, 2)
+        #         if f.read() != b"\xff\xd9":  # corrupt JPEG
+        #             ImageOps.exif_transpose(Image.open(im_file)).save(im_file, "JPEG", subsampling=0, quality=100)
+        #             msg = f"{prefix}WARNING ⚠️ {im_file}: corrupt JPEG restored and saved"
 
         # verify labels
         if os.path.isfile(lb_file):
@@ -1341,7 +1464,7 @@ class ClassificationDataset(torchvision.datasets.ImageFolder):
 
 
 def create_classification_dataloader(
-    path, imgsz=224, batch_size=16, augment=True, cache=False, rank=-1, workers=8, shuffle=True
+        path, imgsz=224, batch_size=16, augment=True, cache=False, rank=-1, workers=8, shuffle=True
 ):
     # Returns Dataloader object to be used with YOLOv5 Classifier
     """Creates a DataLoader for image classification, supporting caching, augmentation, and distributed training."""
