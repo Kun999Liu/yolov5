@@ -158,11 +158,11 @@ def readTif(img_file_path, bands=3):
 
     # --- 【关键修改】使用 2% 拉伸替代 Min-Max ---
     # 这一步能显著增强金属目标的 Intensity 特征
-    img = normalize_percentile(img_array)
+    # img = normalize_percentile(img_array)
     '''校正后处理'''
-    # imgScale = (img_array - np.min(img_array)) / (np.max(img_array) - np.min(img_array))
-    #
-    # img = np.round(imgScale * 255).astype(np.uint8)
+    imgScale = (img_array - np.min(img_array)) / (np.max(img_array) - np.min(img_array))
+
+    img = np.round(imgScale * 255).astype(np.uint8)
     # # TIS GIU 使用
     img = np.transpose(img, (1, 2, 0))
     # img = histEqualize(img)
@@ -676,6 +676,7 @@ class LoadImagesAndLabels(Dataset):
         self.stride = stride
         self.path = path
         self.albumentations = Albumentations(size=img_size) if augment else None
+        self.mode = "tif"
 
         try:
             f = []  # image files
@@ -963,7 +964,7 @@ class LoadImagesAndLabels(Dataset):
             self.npy_files[i],
         )
         if im is None:  # not cached in RAM
-            if fn.exists():  # load npy
+            if fn.exists() and self.mode=="npy":  # load npy
                 im = np.load(fn)
             else:  # read image
                 # im = cv2.imread(f)  # BGR
